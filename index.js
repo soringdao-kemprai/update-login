@@ -1,147 +1,115 @@
 /**
- * Appwrite Cloud Function (Node 18)
+ * Appwrite Cloud Function: update-login
  *
- * Exported function: userFunction(context)
- * - This function will be called by Appwrite's runtime.
- * - It returns via context.res.json(...) to satisfy the runtime requirement.
+ * Required environment variables (set in the Appwrite function UI):
+ *  - APPWRITE_ENDPOINT          (e.g. https://nyc.cloud.appwrite.io/v1)
+ *  - APPWRITE_PROJECT_ID       (project id)
+ *  - APPWRITE_API_KEY          (server key / dynamic key with necessary perms)
+ *  - APPWRITE_DATABASE_ID
+ *  - APPWRITE_USER_COLLECTION_ID
  *
- * Required function environment variables (set in Appwrite function environment):
- * - APPWRITE_ENDPOINT
- * - APPWRITE_PROJECT_ID (or APPWRITE_PROJECT)
- * - APPWRITE_API_KEY
- * - APPWRITE_DATABASE_ID
- * - APPWRITE_USER_COLLECTION_ID
- *
- * Payload expected (JSON):
+ * Payload expected (JSON) - passed when calling Functions.createExecution:
  * {
  *   "profileId": "<document id in user collection>",
- *   "accountId": "<appwrite auth user id>",
- *   "currentPassword": "<optional, for client validation>",
- *   "newPhone": "9876543210",    // optional
- *   "newEmail": "you@example.com", // optional
- *   "name": "Full Name",         // optional
- *   "newPassword": "..."         // optional
+ *   "accountId": "<appwrite auth user id (account id)>",
+ *   "currentPassword": "<user's current password - optional>",
+ *   "newPhone": "9876543210",       // digits-only or any string
+ *   "newEmail": "you@example.com",  // optional
+ *   "name": "Full Name",            // optional
+ *   "newPassword": "..."            // optional
  * }
+ *
+ * ALWAYS returns JSON to stdout:
+ *   { ok: true, account: <account-response-or-null>, profile: <profile-response-or-null> }
+ * or { ok: false, message: "...", detail: ... }
  */
 
 const sdk = require("node-appwrite");
-const { URLSearchParams } = require("url");
 
-/** Helper to respond in both console and Appwrite context */
-function respond(context, obj) {
+// helper to ensure we always output JSON to stdout for Appwrite
+function finish(obj) {
   try {
-    const json = JSON.stringify(obj);
-    console.log(json);
-    if (context && context.res && typeof context.res.json === "function") {
-      return context.res.json(obj);
-    }
+    console.log(JSON.stringify(obj));
   } catch (e) {
-    console.log(JSON.stringify({ ok: false, message: "Failed to stringify response", raw: String(obj) }));
-    if (context && context.res && typeof context.res.json === "function") {
-      return context.res.json({ ok: false, message: "Failed to stringify response" });
-    }
+    console.log(JSON.stringify({ ok: false, message: "Failed to stringify result", raw: String(obj) }));
   }
-  // If context.res not available, just return object (some runtimes may ignore)
-  return obj;
+  // do NOT call process.exit() immediately; runtime handles closure
 }
 
-/** Robustly read payload from different sources: context.payload, request.body, env var, stdin, urlencoded wrappers */
-async function readPayloadPossible(context) {
-  // 1) context.payload (Appwrite higher-level property)
-  if (context && context.payload && Object.keys(context.payload).length) {
-    return context.payload;
-  }
+/**
+ * Read payload robustly:
+ *  - APPWRITE_FUNCTION_DATA (recommended)
+ *  - APPWRITE_FUNCTION_PAYLOAD (older)
+ *  - stdin (some runtimes)
+ *  - Also support Appwrite HTTP wrapper where req.body may be stringified
+ */
+async function readPayload() {
+  let raw = process.env.APPWRITE_FUNCTION_DATA || process.env.APPWRITE_FUNCTION_PAYLOAD || null;
 
-  // 2) context.request?.body (Appwrite wrapper includes request)
-  if (context && context.request && context.request.body) {
-    // If it's an object already, return it
-    if (typeof context.request.body === "object") return context.request.body;
-    // If string: try JSON parse
-    try {
-      return JSON.parse(context.request.body);
-    } catch {}
-  }
-
-  // 3) APPWRITE_FUNCTION_DATA or APPWRITE_FUNCTION_PAYLOAD env (older runtimes)
-  const rawEnv = process.env.APPWRITE_FUNCTION_DATA || process.env.APPWRITE_FUNCTION_PAYLOAD || null;
-  if (rawEnv) {
-    try {
-      return JSON.parse(rawEnv);
-    } catch (e) {
-      try {
-        return JSON.parse(JSON.parse(rawEnv));
-      } catch {}
-      // If rawEnv looks urlencoded body=..., try to extract
-      if (rawEnv.includes("=") && rawEnv.includes("%7B")) {
-        try {
-          const params = new URLSearchParams(rawEnv);
-          const maybe = params.get("body") || params.get("payload") || params.get("data");
-          if (maybe) {
-            try { return JSON.parse(decodeURIComponent(maybe)); } catch {}
-            try { return JSON.parse(maybe); } catch {}
-          }
-        } catch (e) {}
-      }
-    }
-  }
-
-  // 4) try to read stdin (some runtimes provide payload via stdin)
-  let stdin = "";
-  if (!process.stdin.isTTY) {
-    stdin = await new Promise((resolve) => {
+  if (!raw) {
+    raw = await new Promise((resolve) => {
       let data = "";
-      try {
-        process.stdin.on("data", (c) => (data += c));
-        process.stdin.on("end", () => resolve(data));
-        setTimeout(() => resolve(data || ""), 200);
-      } catch (e) {
-        resolve("");
-      }
+      if (typeof process.stdin === "undefined") return resolve("");
+      process.stdin.on("data", (c) => (data += c));
+      process.stdin.on("end", () => resolve(data));
+      // small timeout fallback
+      setTimeout(() => resolve(data), 300);
     });
   }
-  if (stdin) {
-    // try parse common patterns
-    if (stdin.includes("=") && stdin.includes("%7B")) {
-      try {
-        const params = new URLSearchParams(stdin);
-        const maybe = params.get("body") || params.get("payload") || params.get("data");
-        if (maybe) {
-          try { return JSON.parse(decodeURIComponent(maybe)); } catch {}
-          try { return JSON.parse(maybe); } catch {}
-        }
-      } catch (e) {}
-    }
-    try { return JSON.parse(stdin); } catch (e) {
-      try { return JSON.parse(JSON.parse(stdin)); } catch (e2) { /* ignore */ }
-    }
-  }
 
-  // nothing found
-  return {};
+  if (!raw) return {};
+
+  // If Appwrite passed an object-like wrapper (as in function simulator logs), try to pluck body
+  try {
+    // raw might already be an object (when local dev)
+    if (typeof raw === "object") {
+      return raw;
+    }
+    let parsed = JSON.parse(raw);
+
+    // some Appwrite dashboards pass structure { req: { body: "..." } }
+    if (parsed && parsed.req && parsed.req.body) {
+      try {
+        return JSON.parse(parsed.req.body);
+      } catch (_) {
+        // maybe already JSON object
+        try { return parsed.req.body; } catch (__) { /* fallback */ }
+      }
+    }
+
+    // when payload is nested stringified JSON
+    if (typeof parsed === "string") {
+      try { return JSON.parse(parsed); } catch (_) { return parsed; }
+    }
+
+    return parsed || {};
+  } catch (e) {
+    // If parse fails, return empty
+    return {};
+  }
 }
 
-/** The exported function Appwrite expects */
-module.exports = async function userFunction(context) {
+(async function main() {
   try {
-    // Use env from context if present, else fallback to process.env
-    const env = (context && context.env) ? { ...process.env, ...context.env } : process.env;
-
-    const endpoint = env.APPWRITE_ENDPOINT;
-    const projectId = env.APPWRITE_PROJECT_ID || env.APPWRITE_PROJECT;
-    const apiKey = env.APPWRITE_API_KEY;
-    const databaseId = env.APPWRITE_DATABASE_ID;
-    const userCollectionId = env.APPWRITE_USER_COLLECTION_ID;
+    const endpoint = process.env.APPWRITE_ENDPOINT;
+    const projectId = process.env.APPWRITE_PROJECT_ID || process.env.APPWRITE_PROJECT;
+    const apiKey = process.env.APPWRITE_API_KEY;
+    const databaseId = process.env.APPWRITE_DATABASE_ID;
+    const userCollectionId = process.env.APPWRITE_USER_COLLECTION_ID;
 
     if (!endpoint || !projectId || !apiKey || !databaseId || !userCollectionId) {
-      return respond(context, {
+      return finish({
         ok: false,
         message:
-          "Missing required environment variables. Ensure APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID (or APPWRITE_PROJECT), APPWRITE_API_KEY, APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID are set."
+          "Missing required environment variables. Ensure APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY, APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID are set."
       });
     }
 
-    // Read payload from the most likely places
-    const body = await readPayloadPossible(context);
+    const body = await readPayload();
+
+    // if function invoked via HTTP wrapper in console, the payload may be under bodyJson or body
+    const payload = body.bodyJson ?? body.body ?? body;
+
     const {
       profileId,
       accountId,
@@ -150,22 +118,23 @@ module.exports = async function userFunction(context) {
       newEmail,
       name,
       newPassword
-    } = body || {};
+    } = payload || {};
 
     if (!profileId || !accountId) {
-      return respond(context, { ok: false, message: "profileId and accountId are required in payload", payload: body });
+      return finish({ ok: false, message: "profileId and accountId are required in payload", payload });
     }
 
-    // Init Appwrite SDK client
-    const client = new sdk.Client()
-      .setEndpoint(String(endpoint).replace(/\/$/, "")) // trim trailing slash
+    // Create Appwrite client for server-side admin operations (use API key)
+    const client = new sdk.Client();
+    client
+      .setEndpoint(endpoint.replace(/\/$/, "")) // remove trailing slash
       .setProject(projectId)
       .setKey(apiKey);
 
     const users = new sdk.Users(client);
     const databases = new sdk.Databases(client);
 
-    // Build new login identifier if phone/email changed
+    // Build new login identifier: for phone we store `<digits>@phone.local` as the Appwrite login identifier
     let newIdentifier = null;
     if (newPhone && String(newPhone).trim()) {
       const digits = String(newPhone).replace(/\D/g, "");
@@ -174,7 +143,7 @@ module.exports = async function userFunction(context) {
       newIdentifier = String(newEmail).trim();
     }
 
-    // 1) Update Auth user (users.update)
+    // 1) Update auth user (users.update) if we have anything to change
     let updatedAccount = null;
     const updateArgs = {};
     if (newIdentifier) updateArgs.email = newIdentifier;
@@ -183,19 +152,16 @@ module.exports = async function userFunction(context) {
 
     if (Object.keys(updateArgs).length > 0) {
       try {
-        // users.update(userId, email=null, password=null, name=null, url=null)
+        // node-appwrite users.update signature: users.update(userId, email, password, name, url=null)
         const emailForSdk = updateArgs.email ?? null;
         const passwordForSdk = updateArgs.password ?? null;
         const nameForSdk = updateArgs.name ?? null;
 
         updatedAccount = await users.update(accountId, emailForSdk, passwordForSdk, nameForSdk);
-        console.log("Updated Auth user:", { accountId, updatedAccountId: updatedAccount.$id ?? updatedAccount.$id ?? null });
+        // continue if succeeded
       } catch (uErr) {
-        console.error("Failed to update Auth user:", uErr);
-        return respond(context, { ok: false, message: "Failed to update Auth user", detail: uErr?.message ?? String(uErr) });
+        return finish({ ok: false, message: "Failed to update Auth user", detail: (uErr && uErr.message) || uErr });
       }
-    } else {
-      console.log("No Auth update required.");
     }
 
     // 2) Update profile document in DB
@@ -208,20 +174,15 @@ module.exports = async function userFunction(context) {
     if (Object.keys(profileData).length > 0) {
       try {
         updatedProfile = await databases.updateDocument(databaseId, userCollectionId, profileId, profileData);
-        console.log("Updated profile document:", { profileId, updatedDocId: updatedProfile.$id });
       } catch (pErr) {
-        console.error("Failed to update profile document:", pErr);
-        // If auth update already happened, you may want to rollback — here we fail and report.
-        return respond(context, { ok: false, message: "Failed to update profile document", detail: pErr?.message ?? String(pErr) });
+        // If account updated but profile failed, return error. Optionally implement rollback here.
+        return finish({ ok: false, message: "Failed to update profile document", detail: (pErr && pErr.message) || pErr });
       }
-    } else {
-      console.log("No profile update required.");
     }
 
     // Success
-    return respond(context, { ok: true, account: updatedAccount ?? null, profile: updatedProfile ?? null });
+    return finish({ ok: true, account: updatedAccount ?? null, profile: updatedProfile ?? null });
   } catch (err) {
-    console.error("Unhandled function error:", err);
-    return respond(context, { ok: false, message: "Unhandled function error", detail: err?.message ?? String(err) });
+    return finish({ ok: false, message: "Unhandled function error", detail: (err && err.message) || String(err) });
   }
-};
+})();
