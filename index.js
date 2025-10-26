@@ -1,4 +1,4 @@
-// index.js (Appwrite Cloud Function)
+// index.js  (Appwrite Cloud Function)
 const fetch = globalThis.fetch || require("node-fetch");
 
 // Accept both APPWRITE_PROJECT and APPWRITE_PROJECT_ID for convenience
@@ -10,14 +10,18 @@ const userCollectionId = process.env.APPWRITE_USER_COLLECTION_ID;
 
 function logAndExitBad(msg, detail) {
   console.error(msg, detail ?? "");
+  // Always output a valid JSON object to stdout so the client can parse it.
   console.log(JSON.stringify({ ok: false, message: msg, detail: detail ?? null }));
   process.exit(1);
 }
 
 if (!endpoint || !projectId || !apiKey || !databaseId || !userCollectionId) {
-  logAndExitBad("Missing required environment variables. Make sure APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID (or APPWRITE_PROJECT), APPWRITE_API_KEY, APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID are set.");
+  logAndExitBad(
+    "Missing required environment variables. Make sure APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID (or APPWRITE_PROJECT), APPWRITE_API_KEY, APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID are set."
+  );
 }
 
+// Read payload from APPWRITE_FUNCTION_DATA or stdin (robust)
 async function readPayload() {
   let raw = process.env.APPWRITE_FUNCTION_DATA || process.env.APPWRITE_FUNCTION_PAYLOAD || null;
   if (!raw) {
@@ -30,9 +34,15 @@ async function readPayload() {
     });
   }
   if (!raw) return {};
-  try { return JSON.parse(raw); } catch (e) {
-    // sometimes nested JSON is provided as a string
-    try { return JSON.parse(JSON.parse(raw)); } catch { return {}; }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    // sometimes nested JSON is provided as string
+    try {
+      return JSON.parse(JSON.parse(raw));
+    } catch {
+      return {};
+    }
   }
 }
 
@@ -45,7 +55,7 @@ async function run() {
       return console.log(JSON.stringify({ ok: false, message: "profileId and accountId are required" }));
     }
 
-    // Build new login identifier (Appwrite login is email or email-like)
+    // Build new identifier (Appwrite login is email or email-like)
     let newIdentifier = null;
     if (newPhone && String(newPhone).trim()) {
       const digits = String(newPhone).replace(/\D/g, "");
@@ -72,8 +82,14 @@ async function run() {
         },
         body: JSON.stringify(accountUpdateBody),
       });
+
       let json = null;
-      try { json = await resp.json(); } catch (e) { json = null; }
+      try {
+        json = await resp.json();
+      } catch (e) {
+        json = null;
+      }
+
       if (!resp.ok) {
         console.error("Account update failed", resp.status, json);
         return console.log(JSON.stringify({ ok: false, message: "Failed to update account", detail: json || resp.status }));
@@ -99,8 +115,14 @@ async function run() {
         },
         body: JSON.stringify({ data: profileData }),
       });
+
       let json2 = null;
-      try { json2 = await resp2.json(); } catch (e) { json2 = null; }
+      try {
+        json2 = await resp2.json();
+      } catch (e) {
+        json2 = null;
+      }
+
       if (!resp2.ok) {
         console.error("Profile update failed", resp2.status, json2);
         return console.log(JSON.stringify({ ok: false, message: "Failed to update profile document", detail: json2 || resp2.status }));
@@ -108,7 +130,7 @@ async function run() {
       updatedProfile = json2;
     }
 
-    // Success — emit JSON result
+    // Success — emit JSON result (important: function ALWAYS outputs JSON)
     console.log(JSON.stringify({ ok: true, account: updatedAccount, profile: updatedProfile }));
   } catch (err) {
     console.error("Unhandled function error:", err);
