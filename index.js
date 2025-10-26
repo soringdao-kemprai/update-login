@@ -1,170 +1,124 @@
 // update-login/index.js
-// Node 18+ / serverless friendly (Express-style)
-// Environment variables required:
-// APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY,
-// APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID, FUNCTION_SECRET
+import fetch from "node-fetch"; // available in Appwrite Node runtime (v18+)
 
-import express from "express";
-import fetch from "node-fetch";
-
-const app = express();
-app.use(express.json({ limit: "200kb" }));
-
+// Environment variables set in Appwrite Console -> Function -> Settings
 const {
   APPWRITE_ENDPOINT,
   APPWRITE_PROJECT_ID,
   APPWRITE_API_KEY,
   APPWRITE_DATABASE_ID,
-  APPWRITE_USER_COLLECTION_ID,
-  FUNCTION_SECRET,
+  APPWRITE_USER_COLLECTION_ID
 } = process.env;
 
-if (!APPWRITE_ENDPOINT || !APPWRITE_PROJECT_ID || !APPWRITE_API_KEY || !APPWRITE_DATABASE_ID || !APPWRITE_USER_COLLECTION_ID || !FUNCTION_SECRET) {
-  console.error("Missing required env var(s). See README.");
+// Helper to log JSON back to client
+function respond(obj) {
+  console.log(JSON.stringify(obj));
 }
 
-function jsonRes(res, code, body) {
-  res.status(code).json(body);
-}
-
-app.post("/update-login", async (req, res) => {
+async function main() {
   try {
-    // basic secret protection
-    const providedSecret = req.headers["x-function-secret"] || req.headers["x-function-token"];
-    if (!providedSecret || String(providedSecret) !== String(FUNCTION_SECRET)) {
-      return jsonRes(res, 401, { ok: false, message: "Unauthorized (invalid function secret)" });
-    }
+    // Read input payload
+    const raw = process.env.APPWRITE_FUNCTION_DATA || "{}";
+    const input = JSON.parse(raw);
 
     const {
-      profileId,        // document id in users collection
-      accountId,        // Appwrite account id stored on profile (preferred)
-      currentPassword,  // user's current password (required to verify ownership)
-      newPhone,         // digits-only string or undefined
-      newEmail,         // string or undefined
-      name,             // optional display name
-    } = req.body || {};
+      profileId,
+      accountId,
+      currentPassword,
+      newPhone,
+      newEmail,
+      name
+    } = input;
 
-    if (!profileId || !accountId || !currentPassword || (!newPhone && !newEmail && !name)) {
-      return jsonRes(res, 400, { ok: false, message: "Missing required parameters. Need profileId, accountId, currentPassword and at least one of newPhone/newEmail/name" });
+    if (!profileId || !accountId || !currentPassword) {
+      return respond({ ok: false, message: "Missing required fields." });
     }
 
-    // Helper fetch wrapper to Appwrite (non-SDK): include Project header
-    const AW_HEADERS = {
-      "X-Appwrite-Project": APPWRITE_PROJECT_ID,
-      "Content-Type": "application/json",
-    };
-
-    // Step 1: Fetch profile doc server-side to find current login identifier (fallback)
-    const docUrl = `${APPWRITE_ENDPOINT.replace(/\/$/, "")}/v1/databases/${encodeURIComponent(APPWRITE_DATABASE_ID)}/collections/${encodeURIComponent(APPWRITE_USER_COLLECTION_ID)}/documents/${encodeURIComponent(profileId)}`;
-    const docResp = await fetch(docUrl, {
-      method: "GET",
-      headers: AW_HEADERS,
+    // 1️⃣ Fetch profile document
+    const docUrl = `${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${APPWRITE_USER_COLLECTION_ID}/documents/${profileId}`;
+    const docRes = await fetch(docUrl, {
+      headers: { "X-Appwrite-Project": APPWRITE_PROJECT_ID }
     });
-    if (!docResp.ok) {
-      const txt = await docResp.text().catch(() => "");
-      console.error("Failed to fetch profile doc:", docResp.status, txt);
-      return jsonRes(res, 500, { ok: false, message: "Failed to load profile" });
+    if (!docRes.ok) {
+      const err = await docRes.text();
+      return respond({ ok: false, message: "Profile not found", err });
     }
-    const profileDoc = await docResp.json();
+    const profile = await docRes.json();
 
-    // Determine current login identifier
-    const currentEmail = (profileDoc.email && String(profileDoc.email).trim()) || null;
-    const currentPhone = profileDoc.phone && String(profileDoc.phone).replace(/\D/g, "");
-    const currentLoginId = currentEmail || (currentPhone ? `${currentPhone}@phone.local` : null);
-    if (!currentLoginId) {
-      return jsonRes(res, 400, { ok: false, message: "Profile has no usable login identifier" });
-    }
+    const currentEmail =
+      (profile.email && String(profile.email).trim()) || null;
+    const currentPhone = profile.phone
+      ? String(profile.phone).replace(/\D/g, "")
+      : null;
+    const currentLogin = currentEmail || (currentPhone ? `${currentPhone}@phone.local` : null);
+    if (!currentLogin) return respond({ ok: false, message: "No login identifier found" });
 
-    // Step 2: Verify current password by creating a session (REST login)
-    const sessionUrl = `${APPWRITE_ENDPOINT.replace(/\/$/, "")}/v1/account/sessions/email`;
-    let sessionResp;
-    try {
-      sessionResp = await fetch(sessionUrl, {
-        method: "POST",
-        headers: AW_HEADERS,
-        // server->server call uses credentials include? Not necessary; we will just test response status/body
-        body: JSON.stringify({ email: currentLoginId, password: currentPassword }),
-      });
-    } catch (err) {
-      console.error("Network error creating session:", err);
-      return jsonRes(res, 500, { ok: false, message: "Network error verifying password" });
-    }
-
-    if (!sessionResp.ok) {
-      const body = await sessionResp.text().catch(() => "");
-      console.warn("Password verify failed:", sessionResp.status, body);
-      return jsonRes(res, 401, { ok: false, message: "Invalid password" });
-    }
-    // sessionResp ok -> password validated
-
-    // Step 3: Build new account login identifier (if changing)
-    let newIdentifier = null;
-    if (newEmail && String(newEmail).trim()) {
-      newIdentifier = String(newEmail).trim();
-    } else if (newPhone && String(newPhone).trim()) {
-      const digits = String(newPhone).replace(/\D/g, "");
-      newIdentifier = `${digits}@phone.local`;
-    }
-
-    // Step 4: Update Appwrite account using admin key (X-Appwrite-Key)
-    if (newIdentifier || name) {
-      const updateUrl = `${APPWRITE_ENDPOINT.replace(/\/$/, "")}/v1/users/${encodeURIComponent(accountId)}`;
-      const adminHeaders = {
+    // 2️⃣ Verify password by creating session
+    const sessionRes = await fetch(`${APPWRITE_ENDPOINT}/account/sessions/email`, {
+      method: "POST",
+      headers: {
         "X-Appwrite-Project": APPWRITE_PROJECT_ID,
-        "X-Appwrite-Key": APPWRITE_API_KEY,
-        "Content-Type": "application/json",
-      };
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email: currentLogin, password: currentPassword })
+    });
 
-      const payload = {};
-      if (newIdentifier) payload["email"] = newIdentifier;
-      if (name) payload["name"] = name;
-
-      const updateResp = await fetch(updateUrl, {
-        method: "PUT",
-        headers: adminHeaders,
-        body: JSON.stringify(payload),
-      });
-
-      if (!updateResp.ok) {
-        const txt = await updateResp.text().catch(() => "");
-        console.error("Failed to update account:", updateResp.status, txt);
-        return jsonRes(res, 500, { ok: false, message: "Failed to update account identifier", details: txt });
-      }
-      // updated account OK
+    if (!sessionRes.ok) {
+      return respond({ ok: false, message: "Invalid password" });
     }
 
-    // Step 5: Update profile document in DB (phone/email/name)
-    const updatePayload = {};
-    if (newPhone) updatePayload["phone"] = String(newPhone).replace(/\D/g, "");
-    if (newEmail) updatePayload["email"] = String(newEmail).trim();
-    if (name) updatePayload["name"] = name;
+    // 3️⃣ Prepare update payload
+    let newIdentifier = null;
+    if (newEmail && newEmail.trim()) newIdentifier = newEmail.trim();
+    else if (newPhone && newPhone.trim())
+      newIdentifier = `${newPhone.replace(/\D/g, "")}@phone.local`;
 
-    // Appwrite DB patch endpoint:
-    const patchUrl = `${APPWRITE_ENDPOINT.replace(/\/$/, "")}/v1/databases/${encodeURIComponent(APPWRITE_DATABASE_ID)}/collections/${encodeURIComponent(APPWRITE_USER_COLLECTION_ID)}/documents/${encodeURIComponent(profileId)}`;
-    const patchResp = await fetch(patchUrl, {
+    const accountUpdate = {};
+    if (newIdentifier) accountUpdate.email = newIdentifier;
+    if (name && name.trim()) accountUpdate.name = name.trim();
+
+    if (Object.keys(accountUpdate).length > 0) {
+      const accRes = await fetch(`${APPWRITE_ENDPOINT}/users/${accountId}`, {
+        method: "PUT",
+        headers: {
+          "X-Appwrite-Project": APPWRITE_PROJECT_ID,
+          "X-Appwrite-Key": APPWRITE_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(accountUpdate)
+      });
+      if (!accRes.ok) {
+        const txt = await accRes.text();
+        return respond({ ok: false, message: "Failed updating account", txt });
+      }
+    }
+
+    // 4️⃣ Patch user document
+    const patch = {};
+    if (newPhone) patch.phone = newPhone.replace(/\D/g, "");
+    if (newEmail) patch.email = newEmail.trim();
+    if (name) patch.name = name.trim();
+
+    const patchRes = await fetch(docUrl, {
       method: "PATCH",
       headers: {
         "X-Appwrite-Project": APPWRITE_PROJECT_ID,
         "X-Appwrite-Key": APPWRITE_API_KEY,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify(updatePayload),
+      body: JSON.stringify(patch)
     });
 
-    if (!patchResp.ok) {
-      const txt = await patchResp.text().catch(() => "");
-      console.error("Failed to patch profile doc:", patchResp.status, txt);
-      return jsonRes(res, 500, { ok: false, message: "Failed to update profile document", details: txt });
+    if (!patchRes.ok) {
+      const txt = await patchRes.text();
+      return respond({ ok: false, message: "Failed updating profile", txt });
     }
-    const updatedDoc = await patchResp.json();
 
-    // Done — return updated profile doc
-    return jsonRes(res, 200, { ok: true, user: updatedDoc });
+    const updated = await patchRes.json();
+    return respond({ ok: true, user: updated });
   } catch (err) {
-    console.error("Unhandled error in update-login:", err);
-    return jsonRes(res, 500, { ok: false, message: "Server error", error: String(err) });
+    respond({ ok: false, message: "Server error", error: String(err) });
   }
-});
+}
 
-// Export handler for serverless frameworks
-export default app;
+main();
