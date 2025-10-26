@@ -1,11 +1,9 @@
 {
   "name": "update-login-function",
   "version": "1.0.0",
-  "description": "Appwrite Cloud Function to update Auth user (email/phone/password/name) and profile document.",
+  "description": "Update Appwrite Auth user + profile document",
   "main": "index.js",
-  "engines": {
-    "node": "18"
-  },
+  "engines": { "node": "18" },
   "dependencies": {
     "node-appwrite": "^8.0.0"
   }
