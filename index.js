@@ -14,8 +14,8 @@
 const endpoint = process.env.APPWRITE_ENDPOINT;
 const projectId = process.env.APPWRITE_PROJECT_ID;
 const apiKey = process.env.APPWRITE_API_KEY;
-const databaseId = process.env.DATABASE_ID;
-const userCollectionId = process.env.USER_COLLECTION_ID;
+const databaseId = process.env.APPWRITE_DATABASE_ID;
+const userCollectionId = process.env.APPWRITE_USER_COLLECTION_ID;
 
 if (!endpoint || !projectId || !apiKey || !databaseId || !userCollectionId) {
   console.error("Missing required environment variables.");
