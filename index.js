@@ -1,14 +1,14 @@
 // index.js
-// Appwrite Cloud Function: update-login
-// Expects JSON payload:
+// Appwrite Cloud Function "update-login"
+// Expects JSON payload in function execution data:
 // {
 //   "profileId": "<document id in user collection>",
 //   "accountId": "<appwrite auth user id (account id)>",
-//   "currentPassword": "<user's current password - used to verify ownership - optional but recommended>",
+//   "currentPassword": "<user's current password - optional, sent for verification if you want>",
 //   "newPhone": "9876543210",     // digits-only or null
 //   "newEmail": "you@example.com",// optional
 //   "name": "Full Name",          // optional
-//   "newPassword": "..."          // optional: if user wants to change password too
+//   "newPassword": "..."          // optional: change password too
 // }
 
 const endpoint = process.env.APPWRITE_ENDPOINT;
@@ -19,26 +19,30 @@ const userCollectionId = process.env.APPWRITE_USER_COLLECTION_ID;
 
 if (!endpoint || !projectId || !apiKey || !databaseId || !userCollectionId) {
   console.error("Missing required environment variables.");
-  // Appwrite function runtime expects valid status code + response
   console.log(JSON.stringify({ ok: false, message: "Missing environment variables" }));
   process.exit(1);
 }
 
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
 async function run() {
   try {
-    // The payload may be in stdin or in process.env.APPWRITE_FUNCTION_PAYLOAD depending on runtime.
-    let raw = process.env.APPWRITE_FUNCTION_DATA || null;
+    // APPWRITE_FUNCTION_DATA or APPWRITE_FUNCTION_PAYLOAD (depending on runtime)
+    let raw = process.env.APPWRITE_FUNCTION_DATA || process.env.APPWRITE_FUNCTION_PAYLOAD || null;
+
     if (!raw) {
-      // sometimes Appwrite supplies body on stdin
+      // fallback to stdin (some runtimes)
       raw = await new Promise((resolve) => {
         let data = "";
         process.stdin.on("data", (c) => (data += c));
         process.stdin.on("end", () => resolve(data));
-        setTimeout(() => resolve(""), 200);
+        setTimeout(() => resolve(""), 300);
       });
     }
-    const body = raw ? JSON.parse(raw) : {};
 
+    const body = raw ? safeJsonParse(raw) || {} : {};
     const {
       profileId,
       accountId,
@@ -53,8 +57,7 @@ async function run() {
       return console.log(JSON.stringify({ ok: false, message: "profileId and accountId required" }));
     }
 
-    // Build new login identifier:
-    // If newPhone present -> phone login is normalized to digits + '@phone.local'
+    // Build new login identifier
     let newIdentifier = null;
     if (newPhone && String(newPhone).trim()) {
       const digits = String(newPhone).replace(/\D/g, "");
@@ -63,16 +66,16 @@ async function run() {
       newIdentifier = String(newEmail).trim();
     }
 
-    // 1) Update the Appwrite Auth user (admin)
+    // 1) Update the Appwrite Auth user (admin endpoint)
     // PUT /v1/users/{userId}
-    const userUrl = `${endpoint.replace(/\/$/, "")}/v1/users/${encodeURIComponent(accountId)}`;
+    let updatedAccount = null;
     const accountUpdateBody = {};
     if (newIdentifier) accountUpdateBody.email = newIdentifier;
     if (newPassword && String(newPassword).trim()) accountUpdateBody.password = String(newPassword).trim();
     if (name && String(name).trim()) accountUpdateBody.name = String(name).trim();
 
-    let updatedAccount = null;
     if (Object.keys(accountUpdateBody).length > 0) {
+      const userUrl = `${endpoint.replace(/\/$/, "")}/v1/users/${encodeURIComponent(accountId)}`;
       const resp = await fetch(userUrl, {
         method: "PUT",
         headers: {
@@ -91,12 +94,11 @@ async function run() {
       updatedAccount = json;
     }
 
-    // 2) Update profile document in your database collection (so profile fields match)
-    // PATCH /v1/databases/{databaseId}/collections/{collectionId}/documents/{documentId}
+    // 2) Update profile document in database so profile fields match
     const profileUpdateBody = {};
     if (newPhone) profileUpdateBody.phone = String(newPhone).replace(/\D/g, "");
-    if (newEmail && newEmail.trim()) profileUpdateBody.email = String(newEmail).trim();
-    if (name && name.trim()) profileUpdateBody.name = name.trim();
+    if (newEmail && String(newEmail).trim()) profileUpdateBody.email = String(newEmail).trim();
+    if (name && String(name).trim()) profileUpdateBody.name = String(name).trim();
 
     let updatedProfile = null;
     if (Object.keys(profileUpdateBody).length > 0) {
@@ -118,8 +120,8 @@ async function run() {
       updatedProfile = json2;
     }
 
-    // return combined
-    return console.log(JSON.stringify({ ok: true, account: updatedAccount, profile: updatedProfile }));
+    // Success
+    console.log(JSON.stringify({ ok: true, account: updatedAccount, profile: updatedProfile }));
   } catch (err) {
     console.error("Unhandled error in function:", err);
     console.log(JSON.stringify({ ok: false, message: String(err) }));
