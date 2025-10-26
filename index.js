@@ -1,74 +1,59 @@
 /**
- * Appwrite Cloud Function: update-login
+ * Appwrite Cloud Function (Node 18)
  *
- * Runtime: Node 18 (module.exports = async (request, response) => { ... })
+ * Behavior:
+ * - Reads payload from APPWRITE_FUNCTION_DATA or APPWRITE_FUNCTION_PAYLOAD env var, or stdin fallback.
+ * - Expects: { profileId, accountId, currentPassword?, newPhone?, newEmail?, name?, newPassword? }
+ * - Updates Appwrite Auth user (Users.update) when needed.
+ * - Updates profile document in your DB collection when needed.
+ * - Always prints a JSON object to stdout (so client SDK can read function output).
  *
- * Expected environment variables in the function settings:
- * - APPWRITE_ENDPOINT            (e.g. https://nyc.cloud.appwrite.io/v1)
- * - APPWRITE_PROJECT_ID         (or APPWRITE_PROJECT)
- * - APPWRITE_API_KEY            (a server API key or dynamic key with permission to manage users + databases)
- * - APPWRITE_DATABASE_ID
- * - APPWRITE_USER_COLLECTION_ID
- *
- * Payload (JSON) - one of these forms the client may send:
- * {
- *   "profileId": "<document id in user collection>",
- *   "accountId": "<appwrite auth user id (account id)>",
- *   "currentPassword": "<user current password - optional>",
- *   "newPhone": "9876543210",     // digits-only or formatted
- *   "newEmail": "you@example.com",// optional
- *   "name": "Full Name",          // optional
- *   "newPassword": "..."          // optional: set a new password
- * }
- *
- * Response JSON:
- * { ok: true, account: {...} | null, profile: {...} | null }
- * or
- * { ok: false, message: "...", detail?: ... }
+ * Make sure these env vars are configured in the function settings:
+ * APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID (or APPWRITE_PROJECT), APPWRITE_API_KEY,
+ * APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID
  */
 
 const sdk = require("node-appwrite");
 
-// helper to unify response shape
-function finishRes(response, obj, status = 200) {
+function finish(obj) {
+  // Always output JSON to stdout so clients / SDKs can parse function result.
   try {
-    response.json(obj, status);
+    console.log(JSON.stringify(obj));
   } catch (e) {
-    // older runtimes may not support response.json(status) signature; try other forms
-    if (typeof response.send === "function") {
-      response.send(JSON.stringify(obj), status);
-    } else {
-      // fallback: write to stdout (shouldn't be needed in Appwrite runtime)
-      console.log(JSON.stringify(obj));
-    }
+    console.log(JSON.stringify({ ok: false, message: "Failed to stringify result", raw: String(obj) }));
+  }
+  // Do not call process.exit() — let platform handle lifecycle.
+}
+
+function safeParseJSON(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) {
+    try { return JSON.parse(JSON.parse(raw)); } catch (e2) { return null; }
   }
 }
 
-function parseBodyFromRequest(request) {
-  // Appwrite runtime exposes different fields depending on trigger type / SDK version.
-  // Try several known properties:
-  if (!request) return {};
-  if (request.payload) return request.payload;
-  if (request.bodyJson) return request.bodyJson;
-  if (request.body) {
-    // body may already be parsed object or URL-encoded string
-    if (typeof request.body === "object") return request.body;
-    try { return JSON.parse(request.body); } catch {}
-    // try fallback to bodyText if available
+async function readPayload() {
+  // Appwrite may provide payload in APPWRITE_FUNCTION_DATA or APPWRITE_FUNCTION_PAYLOAD
+  let raw = process.env.APPWRITE_FUNCTION_DATA || process.env.APPWRITE_FUNCTION_PAYLOAD || null;
+
+  if (!raw) {
+    // fallback to reading stdin (function invoked with body)
+    raw = await new Promise((resolve) => {
+      let data = "";
+      process.stdin.on("data", (chunk) => (data += chunk));
+      process.stdin.on("end", () => resolve(data));
+      // small timeout so we don't block forever in case platform doesn't send stdin
+      setTimeout(() => resolve(""), 300);
+    });
   }
-  if (request.bodyText) {
-    try { return JSON.parse(request.bodyText); } catch {}
-  }
-  // Sometimes Appwrite provides raw text in request.payload or request.rawBody etc.
-  if (request.rawBody) {
-    try { return JSON.parse(request.rawBody); } catch {}
-  }
-  return {};
+
+  if (!raw) return {};
+  const parsed = safeParseJSON(raw);
+  return parsed || {};
 }
 
-module.exports = async function (request, response) {
+(async function main() {
   try {
-    // read envs (support both variants APPWRITE_PROJECT_ID or APPWRITE_PROJECT)
     const endpoint = process.env.APPWRITE_ENDPOINT;
     const projectId = process.env.APPWRITE_PROJECT_ID || process.env.APPWRITE_PROJECT;
     const apiKey = process.env.APPWRITE_API_KEY;
@@ -76,39 +61,30 @@ module.exports = async function (request, response) {
     const userCollectionId = process.env.APPWRITE_USER_COLLECTION_ID;
 
     if (!endpoint || !projectId || !apiKey || !databaseId || !userCollectionId) {
-      return finishRes(response, {
+      return finish({
         ok: false,
         message:
-          "Missing required environment variables. Make sure APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID (or APPWRITE_PROJECT), APPWRITE_API_KEY, APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID are set.",
-      }, 500);
+          "Missing required environment variables. Ensure APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID (or APPWRITE_PROJECT), APPWRITE_API_KEY, APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID are set."
+      });
     }
 
-    // parse payload robustly
-    const body = parseBodyFromRequest(request) || {};
-    const {
-      profileId,
-      accountId,
-      currentPassword,
-      newPhone,
-      newEmail,
-      name,
-      newPassword,
-    } = body;
+    const body = await readPayload();
+    const { profileId, accountId, currentPassword, newPhone, newEmail, name, newPassword } = body || {};
 
     if (!profileId || !accountId) {
-      return finishRes(response, { ok: false, message: "profileId and accountId are required in payload", payload: body }, 400);
+      return finish({ ok: false, message: "profileId and accountId are required in payload", payload: body || {} });
     }
 
-    // instantiate SDK client
+    // Setup SDK client
     const client = new sdk.Client()
-      .setEndpoint(String(endpoint).replace(/\/$/, "")) // remove trailing slash
+      .setEndpoint(endpoint.replace(/\/$/, "")) // strip trailing slash
       .setProject(projectId)
       .setKey(apiKey);
 
     const users = new sdk.Users(client);
     const databases = new sdk.Databases(client);
 
-    // Build new login identifier: phone -> digits + '@phone.local', else email
+    // Build login identifier if phone provided (Appwrite requires an email-like identifier)
     let newIdentifier = null;
     if (newPhone && String(newPhone).trim()) {
       const digits = String(newPhone).replace(/\D/g, "");
@@ -117,51 +93,55 @@ module.exports = async function (request, response) {
       newIdentifier = String(newEmail).trim();
     }
 
+    // 1) Update auth user (if any change)
     let updatedAccount = null;
-    // Prepare update arguments for SDK users.update(userId, email, password, name, url)
-    const emailForSdk = newIdentifier ?? null;
-    const passwordForSdk = newPassword && String(newPassword).trim() ? String(newPassword).trim() : null;
-    const nameForSdk = name && String(name).trim() ? String(name).trim() : null;
+    const accountUpdateArgs = {};
+    if (newIdentifier) accountUpdateArgs.email = newIdentifier;
+    if (newPassword && String(newPassword).trim()) accountUpdateArgs.password = String(newPassword).trim();
+    if (name && String(name).trim()) accountUpdateArgs.name = String(name).trim();
 
-    if (emailForSdk !== null || passwordForSdk !== null || nameForSdk !== null) {
+    if (Object.keys(accountUpdateArgs).length > 0) {
       try {
-        // node-appwrite users.update signature: users.update(userId, email, password, name, url = null)
+        // node-appwrite Users.update signature: update(userId, email, password, name, url=null)
+        const emailForSdk = accountUpdateArgs.email ?? null;
+        const passwordForSdk = accountUpdateArgs.password ?? null;
+        const nameForSdk = accountUpdateArgs.name ?? null;
+
         updatedAccount = await users.update(accountId, emailForSdk, passwordForSdk, nameForSdk);
+        console.log("Auth user updated:", { accountId, updatedAccountId: updatedAccount?.$id ?? updatedAccount?.id ?? null });
       } catch (uErr) {
-        // return detailed error for debugging (but don't leak secrets)
-        return finishRes(response, {
-          ok: false,
-          message: "Failed to update Auth user (users.update). Check provided accountId / API key permissions.",
-          detail: (uErr && (uErr.message || uErr.toString())) || uErr,
-        }, 500);
+        console.error("Failed to update Auth user:", uErr && uErr.message ? uErr.message : uErr);
+        return finish({ ok: false, message: "Failed to update Auth user", detail: (uErr && uErr.message) || uErr });
       }
+    } else {
+      console.log("No auth update required.");
     }
 
-    // Update profile document in database collection
+    // 2) Update profile document in DB collection (PATCH-like)
     let updatedProfile = null;
-    const profilePatch = {};
-    if (newPhone) profilePatch.phone = String(newPhone).replace(/\D/g, "");
-    if (newEmail && String(newEmail).trim()) profilePatch.email = String(newEmail).trim();
-    if (name && String(name).trim()) profilePatch.name = String(name).trim();
+    const profileData = {};
+    if (newPhone) profileData.phone = String(newPhone).replace(/\D/g, "");
+    if (newEmail && String(newEmail).trim()) profileData.email = String(newEmail).trim();
+    if (name && String(name).trim()) profileData.name = String(name).trim();
 
-    if (Object.keys(profilePatch).length > 0) {
+    if (Object.keys(profileData).length > 0) {
       try {
-        // updateDocument(databaseId, collectionId, documentId, data, read=[], write=[])
-        updatedProfile = await databases.updateDocument(databaseId, userCollectionId, profileId, profilePatch);
+        // databases.updateDocument(databaseId, collectionId, documentId, data, read, write)
+        // NOTE: node-appwrite updateDocument signature may vary by SDK version — supply only required args.
+        updatedProfile = await databases.updateDocument(databaseId, userCollectionId, profileId, profileData);
+        console.log("Profile document updated:", { profileId, updatedProfileId: updatedProfile?.$id ?? updatedProfile?.id ?? null });
       } catch (pErr) {
-        // If auth update succeeded but profile update failed, return error and detail
-        return finishRes(response, {
-          ok: false,
-          message: "Failed to update profile document (databases.updateDocument).",
-          detail: (pErr && (pErr.message || pErr.toString())) || pErr,
-        }, 500);
+        console.error("Failed to update profile document:", pErr && pErr.message ? pErr.message : pErr);
+        return finish({ ok: false, message: "Failed to update profile document", detail: (pErr && pErr.message) || pErr });
       }
+    } else {
+      console.log("No profile update required.");
     }
 
-    // success
-    return finishRes(response, { ok: true, account: updatedAccount ?? null, profile: updatedProfile ?? null });
+    // Success: return merged result (account/profile)
+    return finish({ ok: true, account: updatedAccount ?? null, profile: updatedProfile ?? null });
   } catch (err) {
-    // unexpected unhandled error
-    return finishRes(response, { ok: false, message: "Unhandled function error", detail: (err && (err.message || err.toString())) || err }, 500);
+    console.error("Unhandled function error:", err && err.message ? err.message : err);
+    return finish({ ok: false, message: "Unhandled function error", detail: (err && err.message) || String(err) });
   }
-};
+})();

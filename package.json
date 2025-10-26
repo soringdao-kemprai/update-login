@@ -1,12 +1,13 @@
 {
-  "name": "update-login",
+  "name": "update-login-function",
   "version": "1.0.0",
-  "description": "Appwrite function to update auth user and profile doc when user updates phone/email/name/password",
+  "description": "Appwrite function to update Auth user and profile document (email/phone/password/name).",
   "main": "index.js",
   "engines": {
     "node": "18"
   },
   "dependencies": {
-    "node-appwrite": "^10.0.0"
-  }
+    "node-appwrite": "^9.0.0"
+  },
+  "license": "MIT"
 }
